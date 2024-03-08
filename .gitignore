@@ -1,0 +1,8 @@
+.pyc
+runs/
+analysis_results/
+outputs/
+uploads/
+strip_reader/
+*.pt
+

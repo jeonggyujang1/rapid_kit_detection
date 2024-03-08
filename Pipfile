@@ -1,0 +1,32 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+numpy = "*"
+opencv-python = "*"
+matplotlib = "*"
+torch = "==2.0.1"
+torchvision = "==0.15.2"
+torchaudio = "==2.0.2"
+mpmath = "==1.3.0"
+pandas = "*"
+scikit-learn = "*"
+supervision = "*"
+ultralytics = "*"
+ultralyticsplus = "*"
+fastapi = "*"
+uvicorn = {extras = ["standard"], version = "*"}
+pydantic = "*"
+python-multipart = "*"
+pybase64 = "*"
+
+[dev-packages]
+
+[requires]
+python_version = "3.8"
+python_full_version = "3.8.10"
+
+[pipenv]
+allow_prereleases = true
