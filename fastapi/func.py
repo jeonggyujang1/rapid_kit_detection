@@ -19,6 +19,81 @@ BBOX_MARGIN=0
 # 특정 경로
 BASE_PATH = '/datalakes/0000/rapid_kit_custom/test/images'
 
+def remove_duplicate_coordinates(coordinates, threshold=1, distance_type='euclidean'):
+    flag = 0
+    cleaned_coordinates = []
+    cleaned_coordinates.append(coordinates[0])
+    for i in range(1,len(coordinates) - 1):
+        if flag:
+            flag=0
+            continue
+        x1, y1 = coordinates[i - 1]
+        x2, y2 = coordinates[i]
+        x3, y3 = coordinates[i + 1]
+        if distance_type == 'euclidean':
+            distance1 = np.linalg.norm(coordinates[i]-coordinates[i - 1])
+            distance2 = np.linalg.norm(coordinates[i+1]-coordinates[i])
+        elif distance_type == 'manhattan':
+            distance1 = abs(x2 - x1) + abs(y2 - y1)
+            distance2 = abs(x3 - x2) + abs(y3 - y2)
+
+        if distance1 < threshold and distance2 < threshold:
+            cleaned_coordinates.append(coordinates[i+1])
+            flag = 1
+        else:
+            cleaned_coordinates.append(coordinates[i])
+            flag = 0
+    #cleaned_coordinates.append(coordinates[-1])  # Add the last coordinate
+    return np.array(cleaned_coordinates)
+
+def find_steep_change_indices(coords,topk=1,window_size = 5):
+    window_size = (window_size // 2) * 2 + 1
+
+    # 좌표를 NumPy 배열로 변환
+    coords = np.array(coords)
+
+    # 각 선분의 기울기를 계산
+    #slopes = np.diff(coords[:, 1]) / np.diff(coords[:, 0])
+    radian = np.arctan2(np.diff(coords[:, 1]),np.diff(coords[:, 0]))
+    #radian = np.arctan2(np.abs(np.diff(coords[:, 1])),np.abs(np.diff(coords[:, 0])))
+    #print(f'slopes : {slopes}\n')
+    #print(f'radian : {radian}\n')
+
+    radian_changes = np.abs(np.diff(radian))
+    #print(radian_changes)
+    #print(np.mean(radian_changes),np.std(radian_changes))
+
+    steep_change_indices = []
+    for i in range(window_size//2, len(radian_changes) - window_size//2):  # 시작과 끝 지점을 벗어나지 않도록 인덱스 범위 설정
+        sum_changes = sum(radian_changes[i - window_size//2:i + window_size//2+1])  # 인접한 5개의 라디안 변화량의 합 계산
+        if sum_changes > (np.mean(radian_changes)*window_size + np.std(radian_changes)):  # 합이 평균과 표준편차를 곱한 값보다 큰지 확인
+            steep_change_indices.append(i+1)
+
+    # 변화량이 급격한 순서대로 정렬
+    steep_change_indices.sort(key=lambda x: radian_changes[x-1], reverse=True)
+    #print(steep_change_indices)
+    # 가장 급격한 순서대로 topk개의 인덱스 반환
+    return steep_change_indices[:topk]
+
+# 패턴의 길이를 찾는 함수
+def find_pattern_length(arr):
+    arr_concat = np.array(arr[:,0]*1000+arr[:,1])
+    return len(arr) - len(np.unique(arr_concat))
+
+# 인접한 점들 사이에 새로운 점을 추가하는 함수
+def interpolate_points(points, num_interpolated_points):
+    interpolated_points = []
+    for i in range(len(points) - 1):
+        start_point = points[i]
+        end_point = points[i + 1]
+        for j in range(1, num_interpolated_points + 1):
+            # 새로운 점 추가 (start_point과 end_point 사이에)
+            x = start_point[0] + (end_point[0] - start_point[0]) * j / (num_interpolated_points + 1)
+            y = start_point[1] + (end_point[1] - start_point[1]) * j / (num_interpolated_points + 1)
+            interpolated_points.append([x, y])
+    return np.array(interpolated_points)
+
+
 
 def crop_image_from_yolo_result(result, target_class=3, bgr=True):
     if bgr:
@@ -87,7 +162,6 @@ def interpolate_points(points, num_interpolated_points):
             y = start_point[1] + (end_point[1] - start_point[1]) * j / (num_interpolated_points + 1)
             interpolated_points.append([x, y])
     return np.array(interpolated_points)
-
 
 def perspective_transform(input_img,predictor):
     input_heigth = input_img.shape[0]
@@ -191,6 +265,310 @@ def perspective_transform(input_img,predictor):
                 edge_4pt_dist[3] = cur_dist
                 edge_4pt[3] = [xy[0],xy[1]]
     edge_4pt = np.array(edge_4pt)
+
+    restored_points = np.dot(edge_4pt, rotation_matrix)
+    restored_points[:,0] += org_x
+    restored_points[:,1] += org_y
+
+    pts = restored_points
+    sm = pts.sum(axis=1)  # 4쌍의 좌표 각각 x+y 계산
+    diff = np.diff(pts, axis=1)  # 4쌍의 좌표 각각 x-y 계산
+
+    topLeft = pts[np.argmin(sm)]  # x+y가 가장 값이 좌상단 좌표
+    bottomRight = pts[np.argmax(sm)]  # x+y가 가장 큰 값이 우하단 좌표
+    topRight = pts[np.argmin(diff)]  # x-y가 가장 작은 것이 우상단 좌표
+    bottomLeft = pts[np.argmax(diff)]  # x-y가 가장 큰 값이 좌하단 좌표
+
+    # 변환 전 4개 좌표 
+    pts1 = np.float32([topLeft, topRight, bottomRight, bottomLeft])
+
+    # 변환 후 영상에 사용할 서류의 폭과 높이 계산
+    w1 = abs(bottomRight[0] - bottomLeft[0])
+    w2 = abs(topRight[0] - topLeft[0])
+    h1 = abs(topRight[1] - bottomRight[1])
+    h2 = abs(topLeft[1] - bottomLeft[1])
+    width = max([w1, w2])  # 두 좌우 거리간의 최대값이 서류의 폭
+    height = max([h1, h2])  # 두 상하 거리간의 최대값이 서류의 높이
+
+    # 변환 후 4개 좌표
+    pts2 = np.float32([[0, 0], [width - 1, 0],
+                       [width - 1, height - 1], [0, height - 1]])
+
+    # 변환 행렬 계산 
+    mtrx = cv2.getPerspectiveTransform(pts1, pts2)
+    #print(mtrx)
+    # 원근 변환 적용
+    result = cv2.warpPerspective(input_img, mtrx, (int(width), int(height)))
+    
+    return result
+
+def perspective_transform_v2(input_img,predictor):
+    # Set image
+    predictor.set_image(input_img)  # set with image file
+    #sam_results = predictor(points=[input_img.shape[0]//2,input_img[1]//2],labels=[0])
+    #sam_results = predictor(bboxes=[])
+    sam_results = predictor()
+
+    # Reset image
+    predictor.reset_image()
+
+    largest_segment_size = 0
+    largest_segment_idx = 0
+    for i in range(len(sam_results[0])):
+        xy_ = sam_results[0].masks[i].xy[0]
+        seg_width = xy_[:,0].max()-xy_[:,0].min()
+        seg_heigth = xy_[:,1].max()-xy_[:,1].min()
+        seg_size = seg_heigth*seg_width
+        #print(seg_width,seg_heigth,seg_size)
+        if seg_size > largest_segment_size: 
+            largest_segment_size = seg_size 
+            largest_segment_idx = i
+
+    xy = sam_results[0].masks[largest_segment_idx].xy[0]
+    matrix = np.zeros((2,2))
+    org_x = int((xy[:,0].max()+xy[:,0].min())/2)
+    org_y = int((xy[:,1].max()+xy[:,1].min())/2)
+    #print(org_x,org_y)
+
+    xy[:,0] = xy[:,0] - org_x
+    xy[:,1] = xy[:,1] - org_y
+    
+    matrix = np.zeros((2,2))
+    for i in range(len(xy)):
+        if i == 0 :
+            pass
+        else: 
+            dist = math.sqrt((xy[i][0] - xy[i-1][0])**2 + (xy[i][1] - xy[i-1][1])**2)
+            xx_=xy[i][0]*xy[i][0]
+            yy_=xy[i][1]*xy[i][1]
+            xy_=xy[i][0]*xy[i][1]
+            matrix[0][0]+= xx_*dist
+            matrix[1][1]+= yy_*dist
+            matrix[1][0]-= xy_*dist
+            matrix[0][1]-= xy_*dist
+    
+    w, vl= sc.linalg.eig(matrix)
+
+    # 새로운 축을 기준으로 각도 계산
+    angle = np.arctan2(vl[0,0], vl[0,1])
+
+    # 회전 행렬 생성
+    rotation_matrix = np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]])
+
+    # 각 점을 회전시킴
+    rotated_points = np.dot(xy, rotation_matrix.T)  # 전치(transpose)는 회전 행렬을 사용하기 위해 필요합니다.
+ 
+ 
+ 
+    num_interpolated_points = 100
+    sparse_divide_num=10
+
+    cleaned_coordinates = remove_duplicate_coordinates(rotated_points, threshold=2)
+    print(f'{len(rotated_points)-len(cleaned_coordinates)} points removed')
+
+    rotated_points_flip = np.flip(cleaned_coordinates,axis=0)
+    filtered_coordinates = rotated_points_flip[(rotated_points_flip[:, 0] > 0) & (rotated_points_flip[:, 1] > 0)]
+    closest_to_zero = filtered_coordinates[np.argmin(filtered_coordinates[:, 1])]
+    closest_to_zero_ind = np.where(rotated_points_flip==closest_to_zero)[0][0]
+    reodered_indices = np.arange(0,len(rotated_points_flip))
+    reodered_indices = (reodered_indices+closest_to_zero_ind)%len(rotated_points_flip)
+    reodered_arr = rotated_points_flip[reodered_indices]
+    #print(closest_to_zero_ind)
+
+    x_coords = reodered_arr[:, 0]
+    y_coords = reodered_arr[:, 1]
+
+    # Apply Savitzky-Golay filter to x and y coordinates
+    filtered_x = savgol_filter(x_coords, window_length=10, polyorder=1)
+    filtered_y = savgol_filter(y_coords, window_length=10, polyorder=1)
+
+    reodered_cleaned_coordinates = np.column_stack((filtered_x, filtered_y))
+
+    #print(f'{len(reodered_cleaned_coordinates)} points and ')
+    cleaned_coordinates = remove_duplicate_coordinates(reodered_cleaned_coordinates, threshold=5)
+    print(f'{len(reodered_cleaned_coordinates)-len(cleaned_coordinates)} points removed')
+
+
+    reodered_arr_interp = interpolate_points(cleaned_coordinates, num_interpolated_points)
+    print(f'{len(cleaned_coordinates)-len(reodered_arr_interp)} points added')
+
+    #print(f'{len(reodered_arr_interp)} points and ')
+    cleaned_coordinates = remove_duplicate_coordinates(reodered_arr_interp, threshold=5)
+    print(f'{len(reodered_arr_interp)-len(cleaned_coordinates)} points removed')
+    # 인덱스를 n씩 건너뛰면서 값을 출력
+    sparse_coordinates = cleaned_coordinates[::sparse_divide_num]
+    print(f'{len(cleaned_coordinates)-len(sparse_coordinates)} points removed')
+    
+    print(f'{len(sparse_coordinates)} points remain')
+
+    cleaned_coordinates_circ = sparse_coordinates
+
+    # Divide cleaned_coordinates into quadrants
+    q1 = cleaned_coordinates_circ[np.logical_and(cleaned_coordinates_circ[:, 0] > 0, cleaned_coordinates_circ[:, 1] > 0)]
+    q2 = cleaned_coordinates_circ[np.logical_and(cleaned_coordinates_circ[:, 0] < 0, cleaned_coordinates_circ[:, 1] > 0)]
+    q3 = cleaned_coordinates_circ[np.logical_and(cleaned_coordinates_circ[:, 0] < 0, cleaned_coordinates_circ[:, 1] < 0)]
+    q4 = cleaned_coordinates_circ[np.logical_and(cleaned_coordinates_circ[:, 0] > 0, cleaned_coordinates_circ[:, 1] < 0)]
+
+    q1_unique = q1
+    q2_unique = q2
+    q3_unique = q3
+    q4_unique = q4
+
+    ratio= 0.2
+    # Find steep change indices for each quadrant
+    indices_q1 = find_steep_change_indices(q1_unique, window_size=int(len(q1_unique)*ratio))
+    indices_q2 = find_steep_change_indices(q2_unique, window_size=int(len(q2_unique)*ratio))
+    indices_q3 = find_steep_change_indices(q3_unique, window_size=int(len(q3_unique)*ratio))
+    indices_q4 = find_steep_change_indices(q4_unique, window_size=int(len(q4_unique)*ratio))
+    #indices_q1 = find_steep_change_indices(q1_unique, window_size=sparse_divide_num*5)
+    #indices_q2 = find_steep_change_indices(q2_unique, window_size=sparse_divide_num*5)
+    #indices_q3 = find_steep_change_indices(q3_unique, window_size=sparse_divide_num*5)
+    #indices_q4 = find_steep_change_indices(q4_unique, window_size=sparse_divide_num*5)
+    #print(len(q1_unique), indices_q1, int(len(q1_unique)*ratio))
+    #print(len(q2_unique), indices_q2, int(len(q2_unique)*ratio))
+    #print(len(q3_unique), indices_q3, int(len(q3_unique)*ratio))
+    #print(len(q4_unique), indices_q4, int(len(q4_unique)*ratio))
+
+    # Update edge_4pt with the calculated indices
+    edge_4pt = np.array([q1_unique[indices_q1[0]], q2_unique[indices_q2[0]], q3_unique[indices_q3[0]], q4_unique[indices_q4[0]]])
+
+    print(edge_4pt)
+
+    restored_points = np.dot(edge_4pt, rotation_matrix)
+    restored_points[:,0] += org_x
+    restored_points[:,1] += org_y
+
+    pts = restored_points
+    sm = pts.sum(axis=1)  # 4쌍의 좌표 각각 x+y 계산
+    diff = np.diff(pts, axis=1)  # 4쌍의 좌표 각각 x-y 계산
+
+    topLeft = pts[np.argmin(sm)]  # x+y가 가장 값이 좌상단 좌표
+    bottomRight = pts[np.argmax(sm)]  # x+y가 가장 큰 값이 우하단 좌표
+    topRight = pts[np.argmin(diff)]  # x-y가 가장 작은 것이 우상단 좌표
+    bottomLeft = pts[np.argmax(diff)]  # x-y가 가장 큰 값이 좌하단 좌표
+
+    # 변환 전 4개 좌표 
+    pts1 = np.float32([topLeft, topRight, bottomRight, bottomLeft])
+
+    # 변환 후 영상에 사용할 서류의 폭과 높이 계산
+    w1 = abs(bottomRight[0] - bottomLeft[0])
+    w2 = abs(topRight[0] - topLeft[0])
+    h1 = abs(topRight[1] - bottomRight[1])
+    h2 = abs(topLeft[1] - bottomLeft[1])
+    width = max([w1, w2])  # 두 좌우 거리간의 최대값이 서류의 폭
+    height = max([h1, h2])  # 두 상하 거리간의 최대값이 서류의 높이
+
+    # 변환 후 4개 좌표
+    pts2 = np.float32([[0, 0], [width - 1, 0],
+                       [width - 1, height - 1], [0, height - 1]])
+
+    # 변환 행렬 계산 
+    mtrx = cv2.getPerspectiveTransform(pts1, pts2)
+    #print(mtrx)
+    # 원근 변환 적용
+    result = cv2.warpPerspective(input_img, mtrx, (int(width), int(height)))
+    
+    return result
+
+def perspective_transform_v3(input_img,predictor):
+    
+    num_interpolated_points = 100
+
+    # Set image
+    predictor.set_image(input_img)  # set with image file
+    sam_results = predictor()
+
+    # Reset image
+    predictor.reset_image()
+
+    largest_segment_size = 0
+    largest_segment_idx = 0
+    for i in range(len(sam_results[0])):
+        xy_ = sam_results[0].masks[i].xy[0]
+        seg_width = xy_[:,0].max()-xy_[:,0].min()
+        seg_heigth = xy_[:,1].max()-xy_[:,1].min()
+        seg_size = seg_heigth*seg_width
+        if seg_size > largest_segment_size: 
+            largest_segment_size = seg_size 
+            largest_segment_idx = i
+
+    xy = sam_results[0].masks[largest_segment_idx].xy[0]
+
+    xy = interpolate_points(xy, num_interpolated_points)
+    
+    matrix = np.zeros((2,2))
+    org_x = int((xy[:,0].max()+xy[:,0].min())/2)
+    org_y = int((xy[:,1].max()+xy[:,1].min())/2)
+
+    xy[:,0] = xy[:,0] - org_x
+    xy[:,1] = xy[:,1] - org_y
+    
+    matrix = np.zeros((2,2))
+    for i in range(len(xy)):
+        if i == 0 :
+            pass
+        else: 
+            dist = math.sqrt((xy[i][0] - xy[i-1][0])**2 + (xy[i][1] - xy[i-1][1])**2)
+            xx_=xy[i][0]*xy[i][0]
+            yy_=xy[i][1]*xy[i][1]
+            xy_=xy[i][0]*xy[i][1]
+            matrix[0][0]+= xx_*dist
+            matrix[1][1]+= yy_*dist
+            matrix[1][0]-= xy_*dist
+            matrix[0][1]-= xy_*dist
+    
+    w, vl= sc.linalg.eig(matrix)
+
+    # 새로운 축을 기준으로 각도 계산
+    angle = np.arctan2(vl[0,0], vl[0,1])
+
+    # 회전 행렬 생성
+    rotation_matrix = np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]])
+
+    # 각 점을 회전시킴
+    rotated_points = np.dot(xy, rotation_matrix.T)  # 전치(transpose)는 회전 행렬을 사용하기 위해 필요합니다.
+    
+    search_size = len(rotated_points)//16
+
+    caclulated_arr=[]
+    rotated_points_circ = np.concatenate((rotated_points[-search_size:],rotated_points,rotated_points[:search_size]))
+    for i in range(search_size,len(rotated_points_circ)-search_size):
+        ldist = math.sqrt((rotated_points_circ[i][0] - rotated_points_circ[i-search_size][0])**2 + (rotated_points_circ[i][1] - rotated_points_circ[i-search_size][1])**2)
+        rdist = math.sqrt((rotated_points_circ[i+search_size][0] - rotated_points_circ[i][0])**2 + (rotated_points_circ[i+search_size][1] - rotated_points_circ[i][1])**2)
+        lx=(rotated_points_circ[i][0] - rotated_points_circ[i-search_size][0])/ldist
+        ly=(rotated_points_circ[i][1] - rotated_points_circ[i-search_size][1])/ldist
+        rx=(rotated_points_circ[i][0] - rotated_points_circ[i+search_size][0])/rdist
+        ry=(rotated_points_circ[i][1] - rotated_points_circ[i+search_size][1])/rdist
+        elem=[lx+rx,ly+ry]
+        caclulated_arr.append(elem)
+    caclulated_arr = np.array(caclulated_arr)
+
+    curv_v_mean = caclulated_arr.mean(axis=0)
+    curv_v_std = caclulated_arr.std(axis=0)
+    condition_xy=curv_v_mean+curv_v_std*3
+
+    target_points = np.array([[1, 1], [-1, 1], [-1, -1], [1, -1]])
+
+    filtered_coordinates = []
+
+    # 모든 점들 간의 거리 계산
+    distances = np.linalg.norm(caclulated_arr[:, None, :] - target_points[None, :, :], axis=-1)
+
+    # 각 점마다 가장 가까운 점의 인덱스 찾기
+    closest_indices = np.argmin(distances, axis=0)
+
+    # 가장 가까운 점들 찾기
+    for i, idx in enumerate(closest_indices):
+        filtered_coordinates.append(caclulated_arr[idx])
+
+    filtered_coordinates = np.array(filtered_coordinates)
+
+    mask = np.isin(caclulated_arr,filtered_coordinates)
+    indices = np.where(mask)[0]
+
+    edge_4pt = rotated_points[indices]
+
+    print(edge_4pt)
 
     restored_points = np.dot(edge_4pt, rotation_matrix)
     restored_points[:,0] += org_x
@@ -433,9 +811,6 @@ def gen_result(base_path = BASE_PATH):
     # 파일 이름 순으로 정렬
     img_files.sort()
 
-    # 결과 출력
-    #print(img_files)
-
     model = YOLO('/home/jeonggyu/rapid_kit_detection/models/detection/best_23.pt')
     results = model.predict(source=img_files, save=True, save_txt=True, save_conf=True, conf=0.7, iou = 0.9)
 
@@ -461,7 +836,7 @@ def gen_result(base_path = BASE_PATH):
                 kit_heigth = cropped_kits[i]['img'].shape[1]
                 kit_center = cropped_kits[i]['center']
                 kit_origin = [kit_center[0]-int(kit_heigth/2),kit_center[1]-int(kit_width/2)]
-                transformed_kit = perspective_transform(cropped_kits[i]['img'],predictor)
+                transformed_kit = perspective_transform_v3(cropped_kits[i]['img'],predictor)
                 transformed_kit_list.append(transformed_kit)
                 #plt.imshow(transformed_kit)
                 kit_yolo_result = model.predict(source=transformed_kit, save=True, save_txt=True, save_conf=True, conf=0.25, classes=[3])
