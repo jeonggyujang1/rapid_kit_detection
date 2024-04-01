@@ -5,7 +5,7 @@ import DisplayImages from './DisplayImages';
 const App = () => {
 	  return (
 		      <div>
-		        <h1>Image Upload and Display</h1>
+		        <h1>Rapid Kit Detection</h1>
 		        <ImageManagement />
 		        <DisplayImages />
 		      </div>

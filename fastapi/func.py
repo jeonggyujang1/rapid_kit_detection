@@ -470,8 +470,8 @@ def perspective_transform_v2(input_img,predictor):
     
     return result
 
-def perspective_transform_v3(input_img,predictor):
-    
+def perspective_transform_v3(input_obj,predictor,orig_img):
+    input_img = input_obj['img']
     num_interpolated_points = 100
 
     # Set image
@@ -543,9 +543,9 @@ def perspective_transform_v3(input_img,predictor):
         caclulated_arr.append(elem)
     caclulated_arr = np.array(caclulated_arr)
 
-    curv_v_mean = caclulated_arr.mean(axis=0)
-    curv_v_std = caclulated_arr.std(axis=0)
-    condition_xy=curv_v_mean+curv_v_std*3
+    #curv_v_mean = caclulated_arr.mean(axis=0)
+    #curv_v_std = caclulated_arr.std(axis=0)
+    #condition_xy=curv_v_mean+curv_v_std*3
 
     target_points = np.array([[1, 1], [-1, 1], [-1, -1], [1, -1]])
 
@@ -601,8 +601,23 @@ def perspective_transform_v3(input_img,predictor):
     # 변환 행렬 계산 
     mtrx = cv2.getPerspectiveTransform(pts1, pts2)
     #print(mtrx)
+    
+    #input img에 expand 적용하면?
+    cy,cx = input_obj['center']
+    cw,ch,_ = input_obj['img'].shape
+    dx = int(cw/2*0.1)
+    dy = int(ch/2*0.1)
+
+    print(cx,cy,dx,dy)
+    print(orig_img.shape)
+    orig_w, orig_h,_ = orig_img.shape
+    ratio = 12
+    expanded_cropped_img = orig_img[np.max([0,cx-dx*ratio]):np.min([orig_w,cx+dx*ratio]),np.max([0,cy-dy*ratio]):np.min([orig_h,cy+dy*ratio]),:]
+    expanded_cropped_img = cv2.cvtColor(expanded_cropped_img, cv2.COLOR_BGR2RGB)
+
     # 원근 변환 적용
-    result = cv2.warpPerspective(input_img, mtrx, (int(width), int(height)))
+    #result = cv2.warpPerspective(input_img, mtrx, (int(width), int(height)))
+    result = cv2.warpPerspective(expanded_cropped_img, mtrx, (int(width*(ratio/10)), int(height*(ratio/10))))
     
     return result
 
@@ -828,17 +843,18 @@ def gen_result(base_path = BASE_PATH):
             image_rgb, cropped_kits = crop_image_from_yolo_result(result,target_class=2)#for kit
             print(f'cropped kits (kit): {len(cropped_kits)}')
             t_cropped_strip_dict_list = []
-            transformed_kit_list = []
+            #transformed_kit_list = []
             if len(cropped_kits) == 0:
                 return 0
             for i in range(len(cropped_kits)):
+
                 kit_width = cropped_kits[i]['img'].shape[0]
                 kit_heigth = cropped_kits[i]['img'].shape[1]
                 kit_center = cropped_kits[i]['center']
                 kit_origin = [kit_center[0]-int(kit_heigth/2),kit_center[1]-int(kit_width/2)]
-                transformed_kit = perspective_transform_v3(cropped_kits[i]['img'],predictor)
-                transformed_kit_list.append(transformed_kit)
-                #plt.imshow(transformed_kit)
+                transformed_kit = perspective_transform_v3(cropped_kits[i],predictor, result.orig_img)
+                #transformed_kit_list.append(transformed_kit)
+
                 kit_yolo_result = model.predict(source=transformed_kit, save=True, save_txt=True, save_conf=True, conf=0.25, classes=[3])
                 #print(kit_yolo_result)
                 _ , t_cropped_strips = crop_image_from_yolo_result(kit_yolo_result[0],target_class=3,bgr=False)#for strip
@@ -871,3 +887,36 @@ def gen_result(base_path = BASE_PATH):
             #transformed_imgs = (for strip) [{'img':--, 'center':--},{}...] 
             #result_image_gen_v2(image_rgb, t_cropped_strip_dict_list, result.path, figsize=20)
             result_image_gen_v3(image_rgb, t_cropped_strip_dict_list, result.path, figsize=20)
+
+
+def count_kit(base_path = BASE_PATH):
+    # PNG 파일을 저장할 리스트
+    img_files = []
+
+    # 디렉토리 순회
+    for root, dirs, files in os.walk(base_path):
+        for file in files:
+            # 파일 확장자가 '.png' 인지 확인
+            #if file.endswith('.png'):
+                # 파일의 전체 경로를 생성하여 리스트에 추가
+            file_path = os.path.join(root, file)
+            img_files.append(file_path)
+
+    # 파일 이름 순으로 정렬
+    img_files.sort()
+
+    model = YOLO('/home/jeonggyu/rapid_kit_detection/models/detection/best_29.pt')
+    results = model.predict(source=img_files, save=True, save_txt=False, save_conf=True, conf=0.8, iou = 0.9, project='count_outputs',classes=[2])
+
+    cnt_list = []
+    for result in results: #yolo 결과들 중 한 이미지에 대한 결과
+        cnt = 0
+        if result.boxes is None:
+            return cnt_list
+        for box in result.boxes:
+            if box.cls==2:
+                cnt += 1 
+        cnt_list.append(cnt)
+
+    return cnt_list
+    
