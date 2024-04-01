@@ -5,4 +5,7 @@ outputs/
 uploads/
 strip_reader/
 *.pt
+*.jpeg
+*.png
+*.jpg
 
