@@ -5,12 +5,17 @@ import numpy as np
 import math
 import scipy as sc
 from ultralytics.models.sam import Predictor as SAMPredictor
+from ultralytics import FastSAM
 
 from ultralyticsplus import YOLO
 import matplotlib.patches as patches
 from scipy.signal import find_peaks, savgol_filter
-from scipy.interpolate import interp1d
 
+from scipy.spatial import ConvexHull
+
+
+
+import time
 
 # HoughLines threshold
 HOUGHLINE_RHO=0.5
@@ -18,6 +23,10 @@ HOUGHLINE_THR=100
 BBOX_MARGIN=0
 # 특정 경로
 BASE_PATH = '/datalakes/0000/rapid_kit_custom/test/images'
+
+YOLO_MODEL_COUNT = YOLO('/home/jeonggyu/rapid_kit_detection/models/detection/best_33.pt')
+YOLO_MODEL = YOLO('/home/jeonggyu/rapid_kit_detection/models/detection/best_33.pt')
+YOLO_MODEL_OBB = YOLO('/home/jeonggyu/rapid_kit_detection/models/detection/best_obb_4.pt')
 
 def remove_duplicate_coordinates(coordinates, threshold=1, distance_type='euclidean'):
     flag = 0
@@ -93,21 +102,37 @@ def interpolate_points(points, num_interpolated_points):
             interpolated_points.append([x, y])
     return np.array(interpolated_points)
 
+def remove_noise(coordinates, threshold_size):
+    # Convex Hull을 이용하여 주어진 좌표들을 둘러싸는 다각형을 찾음
+    hull = ConvexHull(coordinates)
+    boundary_points = coordinates[hull.vertices]
+
+    # 주어진 좌표들 중 경계 점과의 거리를 계산
+    distances = np.linalg.norm(coordinates[:, None] - boundary_points, axis=-1)
+    min_distances = np.min(distances, axis=1)
+
+    # 크기 기반 필터링을 사용하여 노이즈 제거
+    filtered_coordinates = coordinates[min_distances <= threshold_size]
+
+    return filtered_coordinates
 
 
-def crop_image_from_yolo_result(result, target_class=3, bgr=True):
+def crop_image_from_yolo_result(result, target_class=1, bgr=True):
     if bgr:
         image_bgr = result.orig_img
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
     else:
         image_rgb = result.orig_img
+    
+    h, w = image_rgb.shape[0], image_rgb.shape[1]
+    
     boxes = result.boxes
 
     cropped_imgs = list()
     for box in boxes:
         if box.cls==target_class:
             x1,y1,x2,y2 = box.xyxy.int().tolist()[0]
-            x1,y1,x2,y2 = x1-BBOX_MARGIN,y1-BBOX_MARGIN,x2+BBOX_MARGIN,y2+BBOX_MARGIN
+            x1,y1,x2,y2 = np.max([0,x1-BBOX_MARGIN]),np.max([0,y1-BBOX_MARGIN]),np.min([w,x2+BBOX_MARGIN]),np.min([h,y2+BBOX_MARGIN])
             #print(x1,y1,x2,y2)
             cropped_imgs.append({'img': image_rgb[y1:y2,x1:x2], 'center': [int((x1+x2)/2),int((y1+y2)/2)]})
 
@@ -119,9 +144,15 @@ def c_value_line_from_img(img, strip_crop_ratio=1):
     # 이미지의 높이와 너비를 가져옵니다.
     height, width = img.shape[:2]
 
-    # crop할 영역의 높이와 너비를 계산합니다.
-    crop_height = int(height * strip_crop_ratio)
-    crop_width = int(width * strip_crop_ratio)
+    if height > width :
+        # crop할 영역의 높이와 너비를 계산합니다.
+        crop_height = int(height*0.9)
+        crop_width = int(width * strip_crop_ratio)  
+    else:
+        # crop할 영역의 높이와 너비를 계산합니다.
+        crop_height = int(height * strip_crop_ratio)
+        crop_width = int(width*0.9)
+
 
     # 좌상단 점을 계산합니다.
     start_y = (height - crop_height) // 2
@@ -480,22 +511,29 @@ def perspective_transform_v3(input_obj,predictor,orig_img):
 
     # Reset image
     predictor.reset_image()
-
+    
     largest_segment_size = 0
     largest_segment_idx = 0
     for i in range(len(sam_results[0])):
-        xy_ = sam_results[0].masks[i].xy[0]
-        seg_width = xy_[:,0].max()-xy_[:,0].min()
-        seg_heigth = xy_[:,1].max()-xy_[:,1].min()
+        xy = sam_results[0].masks[i].xy[0]
+
+        seg_width = xy[:,0].max()-xy[:,0].min()
+        seg_heigth = xy[:,1].max()-xy[:,1].min()
         seg_size = seg_heigth*seg_width
-        if seg_size > largest_segment_size: 
-            largest_segment_size = seg_size 
-            largest_segment_idx = i
+        
+        shp = sam_results[0].masks[i].data.shape
+        
+        if sam_results[0].masks[i].data[shp[0]-1][shp[1]//2-1][shp[2]//2-1]:
+            print(seg_width,seg_heigth,seg_size)
+            if seg_size > largest_segment_size: 
+                largest_segment_size = seg_size 
+                largest_segment_idx = i
+    print(largest_segment_idx)
 
     xy = sam_results[0].masks[largest_segment_idx].xy[0]
 
-    xy = interpolate_points(xy, num_interpolated_points)
-    
+    #xy = interpolate_points(xy, num_interpolated_points)
+    '''
     matrix = np.zeros((2,2))
     org_x = int((xy[:,0].max()+xy[:,0].min())/2)
     org_y = int((xy[:,1].max()+xy[:,1].min())/2)
@@ -528,6 +566,8 @@ def perspective_transform_v3(input_obj,predictor,orig_img):
     # 각 점을 회전시킴
     rotated_points = np.dot(xy, rotation_matrix.T)  # 전치(transpose)는 회전 행렬을 사용하기 위해 필요합니다.
     
+    '''
+    rotated_points=xy
     search_size = len(rotated_points)//16
 
     caclulated_arr=[]
@@ -569,12 +609,14 @@ def perspective_transform_v3(input_obj,predictor,orig_img):
     edge_4pt = rotated_points[indices]
 
     print(edge_4pt)
-
+    '''
     restored_points = np.dot(edge_4pt, rotation_matrix)
     restored_points[:,0] += org_x
     restored_points[:,1] += org_y
-
     pts = restored_points
+    '''
+    pts = edge_4pt
+
     sm = pts.sum(axis=1)  # 4쌍의 좌표 각각 x+y 계산
     diff = np.diff(pts, axis=1)  # 4쌍의 좌표 각각 x-y 계산
 
@@ -621,11 +663,251 @@ def perspective_transform_v3(input_obj,predictor,orig_img):
     
     return result
 
+
+def perspective_transform_v4(input_obj, FSAM, orig_img):
+    start_time = time.time()
+
+    input_img = input_obj['img']
+    input_img = cv2.cvtColor(input_img,cv2.COLOR_BGR2RGB)
+
+    num_interpolated_points = 100
+
+    sam_results = FSAM(input_img, device='cuda:1', retina_masks=True, imgsz=1024, conf=0.25, save=True, project='fsam_outputs')
+
+    execution_time = time.time() - start_time
+    print(f"- - - - - - - - - pt 1 : {execution_time}초 - - - - - - ")
+    start_time = time.time()
+
+    largest_segment_size = 0
+    largest_segment_idx = 0
+    for i in range(len(sam_results[0])):
+        xy = sam_results[0].masks[i].xy[0]
+
+        seg_width = xy[:,0].max()-xy[:,0].min()
+        seg_heigth = xy[:,1].max()-xy[:,1].min()
+        seg_size = seg_heigth*seg_width
+        
+        shp = sam_results[0].masks[i].data.shape
+        
+        if sam_results[0].masks[i].data[shp[0]-1][shp[1]//2-1][shp[2]//2-1]:
+            print(seg_width,seg_heigth,seg_size)
+            if seg_size > largest_segment_size: 
+                largest_segment_size = seg_size 
+                largest_segment_idx = i
+    print(largest_segment_idx)
+
+    xy = sam_results[0].masks[largest_segment_idx].xy[0]
+
+    xy = interpolate_points(xy, num_interpolated_points)
+
+    #xy = remove_noise(xy, 100)
+
+    org_x = int((xy[:, 0].max() + xy[:, 0].min()) / 2)
+    org_y = int((xy[:, 1].max() + xy[:, 1].min()) / 2)
+
+    xy[:, 0] -= org_x
+    xy[:, 1] -= org_y
+
+    execution_time = time.time() - start_time
+    print(f"- - - - - - - - - pt 2 : {execution_time}초 - - - - - - ")
+    start_time = time.time()
+
+    matrix = np.zeros((2, 2))
+    for i in range(1, len(xy)):
+        dist = np.linalg.norm(xy[i] - xy[i - 1])
+        xx_ = xy[i][0] * xy[i][0]
+        yy_ = xy[i][1] * xy[i][1]
+        xy_ = xy[i][0] * xy[i][1]
+        matrix[0][0] += xx_ * dist
+        matrix[1][1] += yy_ * dist
+        matrix[1][0] -= xy_ * dist
+        matrix[0][1] -= xy_ * dist
+
+    w, vl = np.linalg.eig(matrix)
+
+    # Calculate angle
+    angle = np.arctan2(vl[0, 0], vl[0, 1])
+
+    # Rotation matrix
+    rotation_matrix = np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]])
+
+    # Rotate points
+    rotated_points = np.dot(xy, rotation_matrix.T)
+
+    execution_time = time.time() - start_time
+    print(f"- - - - - - - - - pt 3 : {execution_time}초 - - - - - - ")
+    start_time = time.time()
+
+    search_size = len(rotated_points) // 16
+
+    calculated_arr = []
+    rotated_points_circ = np.concatenate((rotated_points[-search_size:], rotated_points, rotated_points[:search_size]))
+    for i in range(search_size, len(rotated_points_circ) - search_size):
+        ldist = np.linalg.norm(rotated_points_circ[i] - rotated_points_circ[i - search_size])
+        rdist = np.linalg.norm(rotated_points_circ[i + search_size] - rotated_points_circ[i])
+        lx = (rotated_points_circ[i][0] - rotated_points_circ[i - search_size][0]) / ldist
+        ly = (rotated_points_circ[i][1] - rotated_points_circ[i - search_size][1]) / ldist
+        rx = (rotated_points_circ[i][0] - rotated_points_circ[i + search_size][0]) / rdist
+        ry = (rotated_points_circ[i][1] - rotated_points_circ[i + search_size][1]) / rdist
+        elem = [lx + rx, ly + ry]
+        calculated_arr.append(elem)
+    calculated_arr = np.array(calculated_arr)
+
+    target_points = np.array([[1, 1], [-1, 1], [-1, -1], [1, -1]])
+
+    distances = np.linalg.norm(calculated_arr[:, None, :] - target_points[None, :, :], axis=-1)
+    closest_indices = np.argmin(distances, axis=0)
+
+    filtered_coordinates = calculated_arr[closest_indices]
+
+    mask = np.isin(calculated_arr, filtered_coordinates)
+    indices = np.where(mask)[0]
+
+    execution_time = time.time() - start_time
+    print(f"- - - - - - - - - pt 4 : {execution_time}초 - - - - - - ")
+    start_time = time.time()
+
+    edge_4pt = rotated_points[indices]
+    print(f'edge_4pt : {edge_4pt}')
+    restored_points = np.dot(edge_4pt, rotation_matrix)
+    restored_points[:, 0] += org_x
+    restored_points[:, 1] += org_y
+
+    print(f'restored_points : {restored_points}')
+
+    pts = restored_points
+    sm = pts.sum(axis=1)
+    diff = np.diff(pts, axis=1)
+
+    topLeft = pts[np.argmin(sm)]
+    bottomRight = pts[np.argmax(sm)]
+    topRight = pts[np.argmin(diff)]
+    bottomLeft = pts[np.argmax(diff)]
+
+    pts1 = np.float32([topLeft, topRight, bottomRight, bottomLeft])
+
+    w1 = abs(bottomRight[0] - bottomLeft[0])
+    w2 = abs(topRight[0] - topLeft[0])
+    h1 = abs(topRight[1] - bottomRight[1])
+    h2 = abs(topLeft[1] - bottomLeft[1])
+    width = max([w1, w2])
+    height = max([h1, h2])
+    
+    x = pts1[0,0]
+    y = pts1[0,1]
+
+    # specify output coordinates for corners of red quadrilateral in order TL, TR, BR, BL as x,
+    pts2 = np.float32([[x,y], [x+width-1,y], [x+width-1,y+height-1], [x,y+height-1]])
+    #pts2 = np.float32([[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]])
+
+    mtrx = cv2.getPerspectiveTransform(pts1, pts2)
+    
+    '''
+    cx, cy = input_obj['center']
+    ch, cw, _ = input_obj['img'].shape
+    print('----- ',cx,cy,cw,ch)
+    dx = int(cw / 2 * 0.1)
+    dy = int(ch / 2 * 0.1)
+    
+    orig_h, orig_w, _ = orig_img.shape
+    print('----- ',orig_w,orig_h)
+    ratio = 12
+    print(np.max([0,cx - dx * ratio]),np.min([cx + dx * ratio,orig_w]),np.max([0,cy - dy * ratio]),np.min([cy + dy * ratio,orig_h]))
+    #expanded_cropped_img = orig_img[np.clip(cx - dx * ratio, 0, orig_w):np.clip(cx + dx * ratio, 0, orig_w),
+    #                     np.clip(cy - dy * ratio, 0, orig_h):np.clip(cy + dy * ratio, 0, orig_h), :]
+    expanded_cropped_img = orig_img[np.max([0,cx - dx * ratio]):np.min([cx + dx * ratio,orig_w]),np.max([0,cy - dy * ratio]):np.min([cy + dy * ratio,orig_h]),:]
+    
+    expanded_cropped_img = cv2.cvtColor(expanded_cropped_img, cv2.COLOR_BGR2RGB)
+
+    #result = cv2.warpPerspective(expanded_cropped_img, mtrx, (int(width * (ratio / 10)), int(height * (ratio / 10))))
+    result = cv2.warpPerspective(expanded_cropped_img, mtrx, (expanded_cropped_img.shape[0],expanded_cropped_img.shape[1]), cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0,0,0))
+    '''
+    input_img = cv2.cvtColor(input_img, cv2.COLOR_BGR2RGB)
+    result = cv2.warpPerspective(input_img, mtrx, (input_img.shape[1],input_img.shape[0]), cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0,0,0))
+
+    execution_time = time.time() - start_time
+    print(f"- - - - - - - - - pt 5 : {execution_time}초 - - - - - - ")
+    start_time = time.time()
+
+    return result 
+
+def perspective_transform_v5(input_obj, orig_img):
+    start_time = time.time()
+
+    input_img = input_obj['img']
+    input_img = cv2.cvtColor(input_img,cv2.COLOR_BGR2RGB)
+
+    results = YOLO_MODEL_OBB.predict(source=input_img, save=True, save_txt=False, conf=0.25, iou=0.7)
+
+    execution_time = time.time() - start_time
+    print(f"- - - - - - - - - pt 1 : {execution_time}초 - - - - - - ")
+    start_time = time.time()
+
+    obb_list = []
+    for i in range(len(results[0].obb)):
+        if results[0].obb[i].cls==0:
+            obb_list.append(results[0].obb[i].xyxyxyxy[0].cpu().numpy())
+
+    pts = obb_list[0]
+    sm = pts.sum(axis=1)
+    diff = np.diff(pts, axis=1)
+
+    topLeft = pts[np.argmin(sm)]
+    bottomRight = pts[np.argmax(sm)]
+    topRight = pts[np.argmin(diff)]
+    bottomLeft = pts[np.argmax(diff)]
+
+    pts1 = np.float32([topLeft, topRight, bottomRight, bottomLeft])
+
+    w1 = abs(bottomRight[0] - bottomLeft[0])
+    w2 = abs(topRight[0] - topLeft[0])
+    h1 = abs(topRight[1] - bottomRight[1])
+    h2 = abs(topLeft[1] - bottomLeft[1])
+    width = max([w1, w2])
+    height = max([h1, h2])
+    
+    x = pts1[0,0]
+    y = pts1[0,1]
+
+    # specify output coordinates for corners of red quadrilateral in order TL, TR, BR, BL as x,
+    pts2 = np.float32([[x,y], [x+width-1,y], [x+width-1,y+height-1], [x,y+height-1]])
+    #pts2 = np.float32([[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]])
+
+    mtrx = cv2.getPerspectiveTransform(pts1, pts2)
+    
+    '''
+    cx, cy = input_obj['center']
+    ch, cw, _ = input_obj['img'].shape
+    print('----- ',cx,cy,cw,ch)
+    dx = int(cw / 2 * 0.1)
+    dy = int(ch / 2 * 0.1)
+    
+    orig_h, orig_w, _ = orig_img.shape
+    print('----- ',orig_w,orig_h)
+    ratio = 12
+    print(np.max([0,cx - dx * ratio]),np.min([cx + dx * ratio,orig_w]),np.max([0,cy - dy * ratio]),np.min([cy + dy * ratio,orig_h]))
+    #expanded_cropped_img = orig_img[np.clip(cx - dx * ratio, 0, orig_w):np.clip(cx + dx * ratio, 0, orig_w),
+    #                     np.clip(cy - dy * ratio, 0, orig_h):np.clip(cy + dy * ratio, 0, orig_h), :]
+    expanded_cropped_img = orig_img[np.max([0,cx - dx * ratio]):np.min([cx + dx * ratio,orig_w]),np.max([0,cy - dy * ratio]):np.min([cy + dy * ratio,orig_h]),:]
+    
+    expanded_cropped_img = cv2.cvtColor(expanded_cropped_img, cv2.COLOR_BGR2RGB)
+
+    #result = cv2.warpPerspective(expanded_cropped_img, mtrx, (int(width * (ratio / 10)), int(height * (ratio / 10))))
+    result = cv2.warpPerspective(expanded_cropped_img, mtrx, (expanded_cropped_img.shape[0],expanded_cropped_img.shape[1]), cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0,0,0))
+    '''
+    input_img = cv2.cvtColor(input_img, cv2.COLOR_BGR2RGB)
+    result = cv2.warpPerspective(input_img, mtrx, (input_img.shape[1],input_img.shape[0]), cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0,0,0))
+
+    execution_time = time.time() - start_time
+    print(f"- - - - - - - - - pt 5 : {execution_time}초 - - - - - - ")
+    start_time = time.time()
+
+    return result
 def result_image_gen_v3(image_rgb, cropped_imgs, image_path, figsize=10):
     value_lines = list()
     colors_list=list()
     fontsize = figsize//2+5   
-    strip_crop_ratio = 0.75
+    strip_crop_ratio = 0.5
     
     for i in range(len(cropped_imgs)):
         value_line, colors = c_value_line_from_img(cropped_imgs[i]['img'],strip_crop_ratio=strip_crop_ratio)
@@ -730,45 +1012,36 @@ def result_image_gen_v3(image_rgb, cropped_imgs, image_path, figsize=10):
         #background_y = list()
         for peak_ind, peak in enumerate(peaks):
             if rotation==0:
-                x_peak = strip_center[0]
                 y_peak = peak
                 #print(rotation, x_peak,y_peak)
                 plt.subplot(subplot_x, subplot_y, subplot_x_kit*subplot_y + 2*img_ind+1)
-                rect = patches.Arrow(x_peak-(strip_width*strip_crop_ratio)//2,y_peak,strip_width*strip_crop_ratio,0 ,alpha = 0.3, linewidth=0.5, edgecolor='magenta', facecolor='None')
+                rect = patches.Arrow(strip_width*(1-strip_crop_ratio)//2,y_peak,strip_width*strip_crop_ratio,0 ,alpha = 0.3, linewidth=0.5, edgecolor='magenta', facecolor='None')
                 plt.gca().add_patch(rect)
-                plt.annotate(f"{smoothed[peak]:.0f}", (x_peak, y_peak), c='magenta', fontsize=fontsize)
+                plt.annotate(f"{smoothed[peak]:.0f}", (strip_width//2, y_peak), c='magenta', fontsize=fontsize)
                 #background_x.append(strip_center[0])
                 #background_y.append(strip_center[1] - strip_heigth//2 + peak)
             else:
-                x_peak = peak - 5
-                y_peak = strip_center[1] - strip_width//2 + peak_ind*10 
+                x_peak = peak
                 #print(rotation, x_peak,y_peak)
                 plt.subplot(subplot_x, subplot_y, subplot_x_kit*subplot_y + 2*img_ind+1)
-                rect = patches.Arrow(x_peak,y_peak-(strip_width*strip_crop_ratio)//2,0,strip_width*strip_crop_ratio ,alpha = 0.3, linewidth=0.5, edgecolor='magenta', facecolor='None')
+                rect = patches.Arrow(x_peak,strip_width*(1-strip_crop_ratio)/2,0,strip_width*strip_crop_ratio ,alpha = 0.3, linewidth=0.5, edgecolor='magenta', facecolor='None')
                 plt.gca().add_patch(rect)
-                plt.annotate(f"{smoothed[peak]:.0f}", (x_peak, y_peak), c='magenta', fontsize=fontsize)
+                plt.annotate(f"{smoothed[peak]:.0f}", (x_peak+3, strip_width//2), c='magenta', fontsize=fontsize)
                 #background_x.append(strip_center[0] - strip_heigth//2 + peak)
                 #background_y.append(strip_center[1])
-        #x_peak_ = int(sum(background_x)/len(background_x))
-        #y_peak_ = int(sum(background_y)/len(background_y))
-        x_peak_ = strip_center[0]
-        y_peak_ = strip_center[1]
-        #print(background_x,background_y)
-        #print(x_peak,y_peak)
-        #print('\n')
-        #print(strip_width)
+
         if rotation==0:
             plt.subplot(subplot_x, subplot_y, subplot_x_kit*subplot_y + 2*img_ind+1)
-            plt.annotate(f"{smoothed[y_peak_]:.0f}", (x_peak_-strip_width//3, y_peak_), c='green', fontsize=fontsize)
-            rect = patches.Arrow(x_peak_-(strip_width*strip_crop_ratio)//2,y_peak_,strip_width*strip_crop_ratio,0 ,alpha = 0.3, linewidth=0.5, edgecolor='green', facecolor='None')
+            plt.annotate(f"{smoothed[strip_heigth//2]:.0f}", (strip_width*0.2, strip_heigth//2), c='green', fontsize=fontsize)
+            rect = patches.Arrow(strip_width*(1-strip_crop_ratio)//2,strip_heigth//2,strip_width*strip_crop_ratio,0 ,alpha = 0.3, linewidth=0.5, edgecolor='green', facecolor='None')
             plt.gca().add_patch(rect)
         else:
             plt.subplot(subplot_x, subplot_y, subplot_x_kit*subplot_y + 2*img_ind+1)
-            plt.annotate(f"{smoothed[x_peak_]:.0f}", (x_peak_, y_peak_-strip_width//3), c='green', fontsize=fontsize)
-            rect = patches.Arrow(x_peak_,y_peak_-(strip_width*strip_crop_ratio)//2,0,strip_width*strip_crop_ratio ,alpha = 0.3, linewidth=0.5, edgecolor='green', facecolor='None')
+            plt.annotate(f"{smoothed[strip_heigth//2]:.0f}", (strip_heigth//2, strip_width*0.8), c='green', fontsize=fontsize)
+            rect = patches.Arrow(strip_heigth//2,strip_width*(1-strip_crop_ratio)/2,0,strip_width*strip_crop_ratio ,alpha = 0.3, linewidth=0.5, edgecolor='green', facecolor='None')
             plt.gca().add_patch(rect)
     #return y_
-    plt.subplots_adjust(wspace=0,hspace=0.1)
+    plt.subplots_adjust(wspace=0.1,hspace=0.1)
     plt.show()
     file_name = image_path.split('/')[-1]
     ext = file_name.split('.')[-1]
@@ -811,9 +1084,11 @@ def find_xy_in_roi(roi_xy1,roi_xy2,xys, base = 'center'):
         return None,None
 
 def gen_result(base_path = BASE_PATH):
+ 
+    start_time = time.time()
+
     # PNG 파일을 저장할 리스트
     img_files = []
-
     # 디렉토리 순회
     for root, dirs, files in os.walk(base_path):
         for file in files:
@@ -825,13 +1100,28 @@ def gen_result(base_path = BASE_PATH):
 
     # 파일 이름 순으로 정렬
     img_files.sort()
+    
+    execution_time = time.time() - start_time
+    print(f"- - - - - 1: {execution_time}초")
+    start_time = time.time()
 
-    model = YOLO('/home/jeonggyu/rapid_kit_detection/models/detection/best_23.pt')
-    results = model.predict(source=img_files, save=True, save_txt=True, save_conf=True, conf=0.7, iou = 0.9)
+    results = YOLO_MODEL_COUNT.predict(source=img_files, save=True, save_txt=True, save_conf=True, conf=0.75, iou = 0.9, device='cuda:0')
 
+    execution_time = time.time() - start_time
+    print(f"- - - - - 2: {execution_time}초")  #0.9
+    start_time = time.time()
+    
     # Create SAMPredictor
-    overrides = dict(conf=0.25, task='segment', mode='predict', imgsz=1024, model="/home/jeonggyu/rapid_kit_detection/models/sam/sam_b.pt", save=True)
+    overrides = dict(conf=0.25, task='segment', mode='predict', imgsz=1024, model="/home/jeonggyu/rapid_kit_detection/models/sam/sam_b.pt", save=True, device="cuda:1")
+    #overrides = dict(max_det=10, half=True, conf=0.25, task='segment', mode='predict', imgsz=256, model="/home/jeonggyu/rapid_kit_detection/models/sam/sam_b.pt", save=True, device="cuda:1")
+    #overrides = dict(conf=0.25, task='segment', mode='predict', imgsz=1024, model="/home/jeonggyu/rapid_kit_detection/models/sam/mobile_sam.pt", save=True,device="cuda:1")
     predictor = SAMPredictor(overrides=overrides)
+
+    FSAM = FastSAM('FastSAM-x.pt')
+
+    execution_time = time.time() - start_time
+    print(f"- - - - - 3: {execution_time}초")
+    start_time = time.time()
 
     #print(len(results))
     for result in results: #yolo 결과들 중 한 이미지에 대한 결과
@@ -839,25 +1129,43 @@ def gen_result(base_path = BASE_PATH):
         print(f'path : {result.path}')
         #print(f'masks : {(result.boxes is not None)}')
         if result.boxes is not None:
+            start_time = time.time()
+            
             #이미지에서 kit들 찾아내고 각 kit들 transform한 뒤, 각 kit에서 strip 추출 후 결과 저장
-            image_rgb, cropped_kits = crop_image_from_yolo_result(result,target_class=2)#for kit
+            image_rgb, cropped_kits = crop_image_from_yolo_result(result,target_class=0)#for kit
             print(f'cropped kits (kit): {len(cropped_kits)}')
             t_cropped_strip_dict_list = []
             #transformed_kit_list = []
             if len(cropped_kits) == 0:
                 return 0
+            
+            execution_time = time.time() - start_time
+            print(f"- - - - - 4: {execution_time}초")
+            
             for i in range(len(cropped_kits)):
-
+                start_time = time.time()
+                
                 kit_width = cropped_kits[i]['img'].shape[0]
                 kit_heigth = cropped_kits[i]['img'].shape[1]
                 kit_center = cropped_kits[i]['center']
                 kit_origin = [kit_center[0]-int(kit_heigth/2),kit_center[1]-int(kit_width/2)]
                 transformed_kit = perspective_transform_v3(cropped_kits[i],predictor, result.orig_img)
+                #transformed_kit = perspective_transform_v4(cropped_kits[i],FSAM, result.orig_img)
+                #transformed_kit = perspective_transform_v5(cropped_kits[i], result.orig_img)
                 #transformed_kit_list.append(transformed_kit)
 
-                kit_yolo_result = model.predict(source=transformed_kit, save=True, save_txt=True, save_conf=True, conf=0.25, classes=[3])
+                execution_time = time.time() - start_time
+                print(f"- - - - - 5-1: {execution_time}초")
+                start_time = time.time()
+
+                kit_yolo_result = YOLO_MODEL.predict(source=transformed_kit, save=True, save_txt=True, save_conf=True,  conf=0.1, iou = 0.9,classes=[1], project='strip_outputs')
                 #print(kit_yolo_result)
-                _ , t_cropped_strips = crop_image_from_yolo_result(kit_yolo_result[0],target_class=3,bgr=False)#for strip
+                _ , t_cropped_strips = crop_image_from_yolo_result(kit_yolo_result[0],target_class=1,bgr=False)#for strip
+                
+                execution_time = time.time() - start_time
+                print(f"- - - - - 5-2: {execution_time}초")
+                start_time = time.time()
+                
                 if len(t_cropped_strips) != 0:
                     print(f'len(t_cropped_strips) = {len(t_cropped_strips)}')
                     
@@ -884,10 +1192,17 @@ def gen_result(base_path = BASE_PATH):
 
                 else:
                     print('strip can not found')
-            #transformed_imgs = (for strip) [{'img':--, 'center':--},{}...] 
-            #result_image_gen_v2(image_rgb, t_cropped_strip_dict_list, result.path, figsize=20)
-            result_image_gen_v3(image_rgb, t_cropped_strip_dict_list, result.path, figsize=20)
+                
+                execution_time = time.time() - start_time
+                print(f"- - - - - 5-3: {execution_time}초")
+                start_time = time.time()
 
+            start_time = time.time()
+
+            result_image_gen_v3(image_rgb, t_cropped_strip_dict_list, result.path, figsize=20)
+            
+            execution_time = time.time() - start_time
+            print(f"- - - - - 6: {execution_time}초")
 
 def count_kit(base_path = BASE_PATH):
     # PNG 파일을 저장할 리스트
@@ -905,8 +1220,7 @@ def count_kit(base_path = BASE_PATH):
     # 파일 이름 순으로 정렬
     img_files.sort()
 
-    model = YOLO('/home/jeonggyu/rapid_kit_detection/models/detection/best_29.pt')
-    results = model.predict(source=img_files, save=True, save_txt=False, save_conf=True, conf=0.8, iou = 0.9, project='count_outputs',classes=[2])
+    results = YOLO_MODEL_COUNT.predict(source=img_files, save=True, save_txt=False, save_conf=True, conf=0.75, iou = 0.9, project='count_outputs',classes=[0])
 
     cnt_list = []
     for result in results: #yolo 결과들 중 한 이미지에 대한 결과
