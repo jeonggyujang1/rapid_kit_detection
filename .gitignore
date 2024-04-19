@@ -8,4 +8,5 @@ strip_reader/
 *.jpeg
 *.png
 *.jpg
+*outputs/
 
